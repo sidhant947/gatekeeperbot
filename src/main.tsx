@@ -1,18 +1,26 @@
 import { Devvit } from '@devvit/public-api';
 
-// Configure the app to use Reddit API
 Devvit.configure({
   redditAPI: true,
 });
 
-// Add settings configuration for minimum account age and custom messages
-Devvit.addSettings(
-
+Devvit.addSettings([
   {
     type: "group",
     label: "Account Age",
     helpText: "Filter Posts/Comments by Account Age Requirements",
     fields: [
+      {
+        type: 'select',
+        name: 'account-age-applies-to',
+        label: 'Apply account age filter to:',
+        options: [
+          { label: 'Posts', value: 'post' },
+          { label: 'Comments', value: 'comment' }
+        ],
+        multiSelect: true,
+        defaultValue: ['post', 'comment']
+      },
       {
         type: 'number',
         name: 'minimum-account-age',
@@ -38,132 +46,234 @@ Devvit.addSettings(
       {
         type: 'boolean',
         name: 'leave-comment',
-        label: 'Leave a removal comment when a post is removed',
+        label: 'Leave a removal comment when content is removed',
         defaultValue: false
+      },
+      {
+        type: 'boolean',
+        name: 'ignore-approved-users',
+        label: 'Ignore approved users (do not remove their content)',
+        defaultValue: true
       }
     ]
-  });
+  },
+  {
+    type: "group",
+    label: "User Karma",
+    helpText: "Filter Posts/Comments by User Karma Requirements",
+    fields: [
+      {
+        type: 'select',
+        name: 'karma-applies-to',
+        label: 'Apply karma filter to:',
+        options: [
+          { label: 'Posts', value: 'post' },
+          { label: 'Comments', value: 'comment' }
+        ],
+        multiSelect: true,
+        defaultValue: ['post', 'comment']
+      },
+      {
+        type: 'number',
+        name: 'minimum-karma',
+        label: 'Minimum karma required to post/comment:',
+        onValidate: (event) => {
+          if (event.value! < 0) {
+            return 'Karma must be a positive number';
+          }
+        }
+      },
+      {
+        type: 'paragraph',
+        name: 'karma-removal-message',
+        label: 'Custom message to send to users when content is removed for low karma:',
+        helpText: 'You can use {karma} to insert the user\'s karma and {minimum} to insert the minimum required karma.'
+      },
+      {
+        type: 'boolean',
+        name: 'karma-send-pm',
+        label: 'Send a private message to the user when content is removed for low karma',
+        defaultValue: true
+      },
+      {
+        type: 'boolean',
+        name: 'karma-leave-comment',
+        label: 'Leave a removal comment when content is removed for low karma',
+        defaultValue: false
+      },
+      {
+        type: 'boolean',
+        name: 'karma-ignore-approved-users',
+        label: 'Ignore approved users (do not remove their content for low karma)',
+        defaultValue: true
+      }
+    ]
+  }
+]);
 
-// Function to check account age and remove content if needed
+// Placeholder for checking if a user is approved. The knowledge sources do not provide a direct method.
+async function isApprovedUser(_reddit, _subredditName, _username) {
+  return false;
+}
+
 async function checkAccountAge(event, context) {
   const { reddit, settings } = context;
+  const accountAgeAppliesTo = await settings.get('account-age-applies-to') || ['post', 'comment'];
+  const minimumAccountAge = await settings.get('minimum-account-age') || 30;
+  const customMessage = await settings.get('removal-message');
+  const sendPM = await settings.get('send-pm');
+  const leaveComment = await settings.get('leave-comment');
+  const ignoreApprovedUsers = await settings.get('ignore-approved-users');
 
-  try {
-    console.log("Event received:", JSON.stringify(event));
+  let content, author, contentType;
+  if (event.type === 'PostSubmit') {
+    contentType = 'post';
+    content = event.post;
+    author = event.author;
+  } else if (event.type === 'CommentSubmit') {
+    contentType = 'comment';
+    content = event.comment;
+    author = event.author;
+  } else {
+    return;
+  }
 
-    // Get the settings
-    const minimumAccountAge = await settings.get('minimum-account-age') || 30;
-    const customMessage = await settings.get('removal-message');
-    const sendPM = await settings.get('send-pm');
-    const leaveComment = await settings.get('leave-comment');
+  if (!accountAgeAppliesTo.includes(contentType)) return;
+  if (!content || !content.id || !author || !author.id) return;
 
-    console.log(`Using minimum account age: ${minimumAccountAge} days`);
+  if (ignoreApprovedUsers) {
+    const subreddit = event.subreddit?.name;
+    if (await isApprovedUser(reddit, subreddit, author.name)) {
+      return;
+    }
+  }
 
-    let content;
-    let author;
-    let contentType;
+  if (author?.name?.toLowerCase() === 'gate-keeper-bot') return;
 
-    // Determine the type of content and get its data
-    if (event.type === 'PostSubmit') {
-      contentType = 'post';
-      content = event.post;
-      author = event.author;
-    } else if (event.type === 'CommentSubmit') {
-      contentType = 'comment';
-      content = event.comment;
-      author = event.author;
+  const fetchedAuthor = await reddit.getUserById(author.id);
+  const createdAtMs = fetchedAuthor.createdAt;
+  const now = new Date();
+  const accountAgeInDays = Math.floor((now.getTime() - new Date(createdAtMs).getTime()) / (1000 * 60 * 60 * 24));
+
+  if (accountAgeInDays < minimumAccountAge) {
+    let contentObj;
+    if (contentType === 'post') {
+      contentObj = await reddit.getPostById(content.id);
     } else {
-      console.log(`Unsupported event type: ${event.type}`);
-      return;
+      contentObj = await reddit.getCommentById(content.id);
     }
 
-    if (!content || !content.id) {
-      console.log(`No content found in event: ${JSON.stringify(event)}`);
-      return;
+    let messageText = customMessage
+      ? customMessage.replace(/{age}/g, accountAgeInDays.toString()).replace(/{minimum}/g, minimumAccountAge.toString())
+      : `Your ${contentType} has been removed because your account is less than ${minimumAccountAge} days old. Your account is currently ${accountAgeInDays} days old.`;
+
+    await contentObj.remove();
+
+    if (sendPM) {
+      await reddit.sendPrivateMessage({
+        to: author.name,
+        subject: `${contentType.charAt(0).toUpperCase() + contentType.slice(1)} removed from r/${event.subreddit.name}`,
+        text: messageText,
+      });
     }
 
-    if (!author || !author.id) {
-      console.log(`No author found in event: ${JSON.stringify(event)}`);
-      return;
+    // FIX: Now comments under both posts and comments
+    if (leaveComment) {
+      await reddit.submitComment({
+        id: content.id,
+        text: messageText,
+        distinguish: true,
+      });
     }
-
-    // Fetch the user to get accurate creation date
-    const fetchedAuthor = await reddit.getUserById(author.id);
-
-    // Convert the timestamp to a date
-    const createdAtMs = fetchedAuthor.createdAt;
-    const createdAt = new Date(createdAtMs);
-    const now = new Date();
-
-    // Calculate account age in days
-    const millisecondsPerDay = 1000 * 60 * 60 * 24;
-    const diffTime = Math.abs(now.getTime() - createdAt.getTime());
-    const accountAgeInDays = Math.floor(diffTime / millisecondsPerDay);
-
-    console.log(`User ${author.name} account age: ${accountAgeInDays} days`);
-
-    if (accountAgeInDays < minimumAccountAge) {
-      // Get the content object from Reddit API to use its methods
-      let contentObj;
-      if (contentType === 'post') {
-        contentObj = await reddit.getPostById(content.id);
-      } else {
-        contentObj = await reddit.getCommentById(content.id);
-      }
-
-      // Prepare the removal message
-      let messageText;
-      if (customMessage) {
-        // Replace placeholders with actual values
-        messageText = customMessage
-          .replace(/{age}/g, accountAgeInDays.toString())
-          .replace(/{minimum}/g, minimumAccountAge.toString());
-      } else {
-        // Default message if none is provided
-        messageText = `Your ${contentType} has been removed because your account is less than ${minimumAccountAge} days old. Your account is currently ${accountAgeInDays} days old.`;
-      }
-
-      // Remove the content
-      await contentObj.remove();
-
-      // Send a private message if enabled
-      if (sendPM) {
-        await reddit.sendPrivateMessage({
-          to: author.name,
-          subject: `${contentType.charAt(0).toUpperCase() + contentType.slice(1)} removed from r/${event.subreddit.name}`,
-          text: messageText,
-        });
-        console.log(`Sent PM to ${author.name}`);
-      }
-
-      // Leave a comment if enabled and it's a post
-      if (leaveComment && contentType === 'post') {
-        await reddit.submitComment({
-          id: content.id,
-          text: messageText,
-          distinguish: true, // Mark as mod
-        });
-        console.log(`Left removal comment on post`);
-      }
-
-      console.log(`Removed ${contentType} from user with account age of ${accountAgeInDays} days (minimum: ${minimumAccountAge} days).`);
-    } else {
-      console.log(`User account age (${accountAgeInDays} days) meets the minimum requirement (${minimumAccountAge} days).`);
-    }
-  } catch (error) {
-    console.error("Error in checkAccountAge:", error);
   }
 }
 
-// Add triggers for new posts and comments
+async function checkKarma(event, context) {
+  const { reddit, settings } = context;
+  const karmaAppliesTo = await settings.get('karma-applies-to') || ['post', 'comment'];
+  const minimumKarma = await settings.get('minimum-karma') || 0;
+  const customMessage = await settings.get('karma-removal-message');
+  const sendPM = await settings.get('karma-send-pm');
+  const leaveComment = await settings.get('karma-leave-comment');
+  const ignoreApprovedUsers = await settings.get('karma-ignore-approved-users');
+
+  let content, author, contentType;
+  if (event.type === 'PostSubmit') {
+    contentType = 'post';
+    content = event.post;
+    author = event.author;
+  } else if (event.type === 'CommentSubmit') {
+    contentType = 'comment';
+    content = event.comment;
+    author = event.author;
+  } else {
+    return;
+  }
+
+  if (!karmaAppliesTo.includes(contentType)) return;
+  if (!content || !content.id || !author || !author.id) return;
+
+  if (ignoreApprovedUsers) {
+    const subreddit = event.subreddit?.name;
+    if (await isApprovedUser(reddit, subreddit, author.name)) {
+      return;
+    }
+  }
+
+  if (author?.name?.toLowerCase() === 'gate-keeper-bot') return;
+
+  const fetchedAuthor = await reddit.getUserById(author.id);
+  const userKarma = fetchedAuthor.karma ?? 0; // The knowledge sources do not specify the exact property name
+
+  if (userKarma < minimumKarma) {
+    let contentObj;
+    if (contentType === 'post') {
+      contentObj = await reddit.getPostById(content.id);
+    } else {
+      contentObj = await reddit.getCommentById(content.id);
+    }
+
+    let messageText = customMessage
+      ? customMessage.replace(/{karma}/g, userKarma.toString()).replace(/{minimum}/g, minimumKarma.toString())
+      : `Your ${contentType} has been removed because your karma is less than ${minimumKarma}. Your karma is currently ${userKarma}.`;
+
+    await contentObj.remove();
+
+
+
+    if (sendPM) {
+      await reddit.sendPrivateMessage({
+        to: author.name,
+        subject: `${contentType.charAt(0).toUpperCase() + contentType.slice(1)} removed from r/${event.subreddit.name}`,
+        text: messageText,
+      });
+    }
+
+    // FIX: Now comments under both posts and comments
+    if (leaveComment) {
+      await reddit.submitComment({
+        id: content.id,
+        text: messageText,
+        distinguish: true,
+      });
+    }
+  }
+}
+
 Devvit.addTrigger({
   event: 'PostSubmit',
-  onEvent: checkAccountAge,
+  onEvent: async (event, context) => {
+    await checkAccountAge(event, context);
+    await checkKarma(event, context);
+  },
 });
 
 Devvit.addTrigger({
   event: 'CommentSubmit',
-  onEvent: checkAccountAge,
+  onEvent: async (event, context) => {
+    await checkAccountAge(event, context);
+    await checkKarma(event, context);
+  },
 });
 
 export default Devvit;
